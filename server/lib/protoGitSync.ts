@@ -72,6 +72,71 @@ function ensureReposRoot() {
   fs.mkdirSync(REPOS_ROOT, { recursive: true });
 }
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function removeDirBestEffort(target: string): Promise<void> {
+  if (!fs.existsSync(target)) return;
+  for (let i = 0; i < 6; i++) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+      return;
+    } catch {
+      await sleep(350 * (i + 1));
+    }
+  }
+}
+
+async function discardRepoDir(repoDir: string): Promise<{ locked: boolean }> {
+  if (!fs.existsSync(repoDir)) return { locked: false };
+
+  const trash = `${repoDir}.trash-${Date.now()}`;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      fs.renameSync(repoDir, trash);
+      void removeDirBestEffort(trash);
+      return { locked: false };
+    } catch {
+      await sleep(250 * (attempt + 1));
+    }
+  }
+
+  await removeDirBestEffort(repoDir);
+  return { locked: fs.existsSync(repoDir) };
+}
+
+async function cloneFresh(
+  slug: string,
+  remote: string,
+): Promise<{ ok: boolean; repoDir: string; stderr: string }> {
+  const repoDir = path.join(REPOS_ROOT, slug);
+  let { locked } = await discardRepoDir(repoDir);
+
+  if (!locked && !fs.existsSync(repoDir)) {
+    const clone = await runGit(REPOS_ROOT, ['clone', '--depth', '1', remote, slug]);
+    return { ok: clone.ok, repoDir, stderr: clone.stderr || 'git clone failed' };
+  }
+
+  const stagingName = `${slug}.__staging-${Date.now()}`;
+  const stagingDir = path.join(REPOS_ROOT, stagingName);
+  const clone = await runGit(REPOS_ROOT, ['clone', '--depth', '1', remote, stagingName]);
+  if (!clone.ok) {
+    await removeDirBestEffort(stagingDir);
+    return { ok: false, repoDir, stderr: clone.stderr || 'git clone failed' };
+  }
+
+  ({ locked } = await discardRepoDir(repoDir));
+  if (!fs.existsSync(repoDir)) {
+    try {
+      fs.renameSync(stagingDir, repoDir);
+      return { ok: true, repoDir, stderr: '' };
+    } catch {
+      return { ok: true, repoDir: stagingDir, stderr: '' };
+    }
+  }
+
+  return { ok: true, repoDir: stagingDir, stderr: '' };
+}
+
 async function readHeadCommit(repoDir: string): Promise<string | null> {
   const r = await runGit(repoDir, ['rev-parse', '--short', 'HEAD']);
   return r.ok ? r.stdout : null;
@@ -95,21 +160,27 @@ async function cloneOrPull(slug: string, gitlabUrl: string): Promise<{ repoDir: 
 
   const repoDir = path.join(REPOS_ROOT, slug);
   const remote = normalizeGitUrl(gitlabUrl);
+  const gitDir = path.join(repoDir, '.git');
+  const hasGit = fs.existsSync(gitDir);
+  const head = hasGit ? await readHeadCommit(repoDir) : null;
+  const broken = hasGit && !head;
 
-  if (!fs.existsSync(path.join(repoDir, '.git'))) {
-    if (fs.existsSync(repoDir)) {
-      fs.rmSync(repoDir, { recursive: true, force: true });
+  if (!hasGit || broken) {
+    const fresh = await cloneFresh(slug, remote);
+    if (!fresh.ok) {
+      return { repoDir: fresh.repoDir, error: fresh.stderr };
     }
-    const clone = await runGit(REPOS_ROOT, ['clone', '--depth', '1', remote, slug]);
-    if (!clone.ok) {
-      return { repoDir, error: clone.stderr || 'git clone failed' };
+    return { repoDir: fresh.repoDir };
+  }
+
+  await runGit(repoDir, ['remote', 'set-url', 'origin', remote]);
+  const pull = await runGit(repoDir, ['pull', '--ff-only']);
+  if (!pull.ok) {
+    const fresh = await cloneFresh(slug, remote);
+    if (!fresh.ok) {
+      return { repoDir: fresh.repoDir, error: pull.stderr || fresh.stderr || 'git pull failed' };
     }
-  } else {
-    await runGit(repoDir, ['remote', 'set-url', 'origin', remote]);
-    const pull = await runGit(repoDir, ['pull', '--ff-only']);
-    if (!pull.ok) {
-      return { repoDir, error: pull.stderr || 'git pull failed' };
-    }
+    return { repoDir: fresh.repoDir };
   }
 
   return { repoDir };
