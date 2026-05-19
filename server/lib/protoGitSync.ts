@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -15,19 +15,40 @@ export type ProtoSyncResult = {
 
 const REPOS_ROOT = path.join(process.cwd(), 'data', 'proto-repos');
 const MANIFEST_PATH = path.join(REPOS_ROOT, 'manifest.json');
+const GIT_TIMEOUT_MS = Number(process.env.PROTO_GIT_TIMEOUT_MS ?? 120_000);
 
-function runGit(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
-  const r = spawnSync('git', args, {
-    cwd,
-    encoding: 'utf-8',
-    windowsHide: true,
-    timeout: Number(process.env.PROTO_GIT_TIMEOUT_MS ?? 120_000),
+function runGit(cwd: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn('git', args, { cwd, windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const finish = (result: { ok: boolean; stdout: string; stderr: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      child.kill();
+      finish({ ok: false, stdout: '', stderr: `git timeout (${GIT_TIMEOUT_MS}ms)` });
+    }, GIT_TIMEOUT_MS);
+
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.on('error', (err) => {
+      finish({ ok: false, stdout: '', stderr: err.message });
+    });
+    child.on('close', (code) => {
+      finish({ ok: code === 0, stdout: stdout.trim(), stderr: stderr.trim() });
+    });
   });
-  return {
-    ok: r.status === 0,
-    stdout: (r.stdout ?? '').trim(),
-    stderr: (r.stderr ?? '').trim(),
-  };
 }
 
 /** Локальный клон рядом с репо: ../x5-proto-{slug} или PROTO_LOCAL_REPO_{SLUG} */
@@ -51,21 +72,21 @@ function ensureReposRoot() {
   fs.mkdirSync(REPOS_ROOT, { recursive: true });
 }
 
-function readHeadCommit(repoDir: string): string | null {
-  const r = runGit(repoDir, ['rev-parse', '--short', 'HEAD']);
+async function readHeadCommit(repoDir: string): Promise<string | null> {
+  const r = await runGit(repoDir, ['rev-parse', '--short', 'HEAD']);
   return r.ok ? r.stdout : null;
 }
 
-function readBranch(repoDir: string): string | null {
-  const r = runGit(repoDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+async function readBranch(repoDir: string): Promise<string | null> {
+  const r = await runGit(repoDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
   return r.ok ? r.stdout : null;
 }
 
-function cloneOrPull(slug: string, gitlabUrl: string): { repoDir: string; error?: string } {
+async function cloneOrPull(slug: string, gitlabUrl: string): Promise<{ repoDir: string; error?: string }> {
   ensureReposRoot();
   const local = resolveLocalProtoRepo(slug);
   if (local) {
-    const pull = runGit(local, ['pull', '--ff-only']);
+    const pull = await runGit(local, ['pull', '--ff-only']);
     if (!pull.ok) {
       return { repoDir: local, error: pull.stderr || 'git pull failed' };
     }
@@ -79,13 +100,13 @@ function cloneOrPull(slug: string, gitlabUrl: string): { repoDir: string; error?
     if (fs.existsSync(repoDir)) {
       fs.rmSync(repoDir, { recursive: true, force: true });
     }
-    const clone = runGit(REPOS_ROOT, ['clone', '--depth', '1', remote, slug]);
+    const clone = await runGit(REPOS_ROOT, ['clone', '--depth', '1', remote, slug]);
     if (!clone.ok) {
       return { repoDir, error: clone.stderr || 'git clone failed' };
     }
   } else {
-    runGit(repoDir, ['remote', 'set-url', 'origin', remote]);
-    const pull = runGit(repoDir, ['pull', '--ff-only']);
+    await runGit(repoDir, ['remote', 'set-url', 'origin', remote]);
+    const pull = await runGit(repoDir, ['pull', '--ff-only']);
     if (!pull.ok) {
       return { repoDir, error: pull.stderr || 'git pull failed' };
     }
@@ -95,44 +116,66 @@ function cloneOrPull(slug: string, gitlabUrl: string): { repoDir: string; error?
 }
 
 function findProtoRoot(repoDir: string): string | null {
-  const candidates = [
-    path.join(repoDir, 'proto'),
-    path.join(repoDir, 'src', 'features'),
-  ];
+  const candidates = [path.join(repoDir, 'proto'), path.join(repoDir, 'src', 'features')];
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }
   return null;
 }
 
-function copyProtoIntoStand(slug: string, repoDir: string): { copiedTo: string | null; error?: string } {
+/** После копирования: proto из repo «tracker» должен импортировать @/features/{slug}/, не жёсткий tracker. */
+function rewriteProtoImportPaths(slug: string, hubProtoDir: string) {
+  const exts = new Set(['.ts', '.tsx']);
+  const walk = (dir: string) => {
+    for (const name of fs.readdirSync(dir)) {
+      const full = path.join(dir, name);
+      const st = fs.statSync(full);
+      if (st.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!exts.has(path.extname(name))) continue;
+      let text = fs.readFileSync(full, 'utf-8');
+      const next = text
+        .replaceAll('@/features/tracker/', `@/features/${slug}/`)
+        .replaceAll("from '@/features/tracker'", `from '@/features/${slug}'`)
+        .replaceAll('from "@/features/tracker"', `from "@/features/${slug}"`);
+      if (next !== text) fs.writeFileSync(full, next, 'utf-8');
+    }
+  };
+  if (fs.existsSync(hubProtoDir)) walk(hubProtoDir);
+}
+
+function copyProtoIntoHub(slug: string, repoDir: string): { copiedTo: string | null; error?: string } {
   const protoRoot = findProtoRoot(repoDir);
   if (!protoRoot) {
     return { copiedTo: null, error: 'В репозитории нет каталога proto/ (ожидается FSD-прототип)' };
   }
 
-  const standProtoDir = path.join(process.cwd(), 'src', 'features', slug, 'proto');
-  fs.mkdirSync(standProtoDir, { recursive: true });
+  const hubProtoDir = path.join(process.cwd(), 'src', 'features', slug, 'proto');
+  fs.mkdirSync(hubProtoDir, { recursive: true });
 
   if (protoRoot.endsWith(`${path.sep}proto`) || protoRoot.endsWith('/proto')) {
-    fs.cpSync(protoRoot, standProtoDir, { recursive: true, force: true });
+    fs.cpSync(protoRoot, hubProtoDir, { recursive: true, force: true });
   } else {
     const slugProto = path.join(protoRoot, slug, 'proto');
     if (fs.existsSync(slugProto)) {
-      fs.cpSync(slugProto, standProtoDir, { recursive: true, force: true });
+      fs.cpSync(slugProto, hubProtoDir, { recursive: true, force: true });
     } else {
       return { copiedTo: null, error: `Не найден proto для slug «${slug}» в репозитории` };
     }
   }
 
-  const marker = path.join(standProtoDir, '.proto-from-git');
+  rewriteProtoImportPaths(slug, hubProtoDir);
+
+  const marker = path.join(hubProtoDir, '.proto-from-git');
   fs.writeFileSync(
     marker,
     JSON.stringify({ slug, repoDir, syncedAt: new Date().toISOString() }, null, 2),
     'utf-8',
   );
 
-  return { copiedTo: standProtoDir };
+  return { copiedTo: hubProtoDir };
 }
 
 function writeManifest(slug: string, entry: Record<string, unknown>) {
@@ -150,7 +193,7 @@ function writeManifest(slug: string, entry: Record<string, unknown>) {
 }
 
 /** Подтянуть репозиторий из GitLab и скопировать proto/* в src/features/{slug}/proto */
-export function syncProtoFromGitlab(slug: string, gitlabUrl: string): ProtoSyncResult {
+export async function syncProtoFromGitlab(slug: string, gitlabUrl: string): Promise<ProtoSyncResult> {
   if (!gitlabUrl?.trim()) {
     return {
       ok: false,
@@ -164,7 +207,7 @@ export function syncProtoFromGitlab(slug: string, gitlabUrl: string): ProtoSyncR
     };
   }
 
-  const { repoDir, error: gitError } = cloneOrPull(slug, gitlabUrl);
+  const { repoDir, error: gitError } = await cloneOrPull(slug, gitlabUrl);
   if (gitError) {
     return {
       ok: false,
@@ -178,9 +221,9 @@ export function syncProtoFromGitlab(slug: string, gitlabUrl: string): ProtoSyncR
     };
   }
 
-  const commit = readHeadCommit(repoDir);
-  const branch = readBranch(repoDir);
-  const { copiedTo, error: copyError } = copyProtoIntoStand(slug, repoDir);
+  const commit = await readHeadCommit(repoDir);
+  const branch = await readBranch(repoDir);
+  const { copiedTo, error: copyError } = copyProtoIntoHub(slug, repoDir);
 
   if (copyError) {
     return {
@@ -200,7 +243,7 @@ export function syncProtoFromGitlab(slug: string, gitlabUrl: string): ProtoSyncR
     gitlabUrl: gitlabUrl.trim(),
     commit,
     branch,
-    standProtoDir: copiedTo,
+    hubProtoDir: copiedTo,
     syncedAt: new Date().toISOString(),
   });
 
@@ -213,8 +256,8 @@ export function syncProtoFromGitlab(slug: string, gitlabUrl: string): ProtoSyncR
     copiedTo,
     message:
       resolveLocalProtoRepo(slug) != null
-        ? 'Обновлено из локального клона (../x5-proto-*), код готов к показу на /proto/'
-        : 'Клон из GitLab обновлён, код готов к показу на /proto/',
+        ? 'Обновлено из локального клона (../x5-proto-*)'
+        : 'Клон из GitLab обновлён',
   };
 }
 

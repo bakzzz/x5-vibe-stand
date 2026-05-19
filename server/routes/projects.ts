@@ -29,7 +29,7 @@ function applySyncToProject(projectId: string, sync: ProtoSyncResult) {
     .run();
 }
 
-function runGitSync(slug: string, gitlabUrl: string): ProtoSyncResult {
+async function runGitSync(slug: string, gitlabUrl: string): Promise<ProtoSyncResult> {
   return syncProtoFromGitlab(slug, gitlabUrl);
 }
 
@@ -43,10 +43,9 @@ function markSyncPending(projectId: string) {
 
 function scheduleGitSync(projectId: string, slug: string, gitlabUrl: string) {
   markSyncPending(projectId);
-  setImmediate(() => {
-    try {
-      applySyncToProject(projectId, runGitSync(slug, gitlabUrl));
-    } catch (err) {
+  void runGitSync(slug, gitlabUrl)
+    .then((sync) => applySyncToProject(projectId, sync))
+    .catch((err) =>
       applySyncToProject(projectId, {
         ok: false,
         slug,
@@ -56,9 +55,8 @@ function scheduleGitSync(projectId: string, slug: string, gitlabUrl: string) {
         copiedTo: null,
         message: 'Ошибка синхронизации',
         error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  });
+      }),
+    );
 }
 
 const importSchema = z.object({
@@ -123,11 +121,12 @@ projectsApi.get('/', (c) => {
   return c.json(rows);
 });
 
-projectsApi.post('/:slug/sync', (c) => {
+projectsApi.post('/:slug/sync', async (c) => {
   const slug = c.req.param('slug');
   const project = db.select().from(projects).where(eq(projects.slug, slug)).get();
   if (!project) return c.json({ error: 'Not found' }, 404);
-  const sync = runGitSync(slug, project.gitlabUrl);
+  markSyncPending(project.id);
+  const sync = await runGitSync(slug, project.gitlabUrl);
   applySyncToProject(project.id, sync);
   const updated = db.select().from(projects).where(eq(projects.id, project.id)).get()!;
   const count = db.select().from(remarks).where(eq(remarks.projectId, project.id)).all().length;
