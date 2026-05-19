@@ -1,0 +1,35 @@
+@font-face {
+  font-family: 'X5 Sans';
+  src: url('./fonts/X5Sans-Light.woff2') format('woff2'),
+    url('./fonts/X5Sans-Light.woff') format('woff');
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'X5 Sans';
+  src: url('./fonts/X5Sans-Regular.woff2') format('woff2'),
+    url('./fonts/X5Sans-Regular.woff') format('woff');
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'X5 Sans';
+  src: url('./fonts/X5Sans-Medium.woff2') format('woff2'),
+    url('./fonts/X5Sans-Medium.woff') format('woff');
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'X5 Sans';
+  src: url('./fonts/X5Sans-Bold.woff2') format('woff2'),
+    url('./fonts/X5Sans-Bold.woff') format('woff');
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+}
