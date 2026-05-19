@@ -41,13 +41,13 @@ export const RegistryPage: React.FC = () => {
       queryClient.invalidateQueries({ queryKey: ['vibe-projects'] });
       setModal(null);
       const updated = (project as { imported?: string }).imported === 'updated';
-      const sync = (project as { sync?: { ok: boolean; message: string } }).sync;
-      if (sync && !sync.ok) {
+      const sync = (project as { sync?: { ok: boolean; message: string; pending?: boolean } }).sync;
+      if (sync?.pending) {
+        message.info('Проект создан. Подтягиваем код из GitLab…');
+      } else if (sync && !sync.ok) {
         message.warning(`${updated ? 'Проект обновлён' : 'Проект импортирован'}, но код не подтянут: ${sync.message}`);
       } else {
-        message.success(
-          updated ? 'Проект обновлён из GitLab' : 'Проект импортирован, прототип готов',
-        );
+        message.success(updated ? 'Проект обновлён из GitLab' : 'Проект импортирован, прототип готов');
       }
       navigate(`/p/${project.slug}`);
     },

@@ -21,6 +21,7 @@ function runGit(cwd: string, args: string[]): { ok: boolean; stdout: string; std
     cwd,
     encoding: 'utf-8',
     windowsHide: true,
+    timeout: Number(process.env.PROTO_GIT_TIMEOUT_MS ?? 120_000),
   });
   return {
     ok: r.status === 0,

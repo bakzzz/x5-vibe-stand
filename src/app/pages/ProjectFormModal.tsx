@@ -60,8 +60,13 @@ export const ProjectFormModal: React.FC<Props> = ({
       destroyOnClose
     >
       <Form form={form} layout="vertical" onFinish={onSubmit}>
-        <Form.Item name="slug" label="Slug" rules={[{ required: true }]}>
-          <Input disabled={mode === 'edit'} />
+        <Form.Item
+          name="slug"
+          label="Slug"
+          rules={[{ required: true }]}
+          extra={mode === 'import' ? 'Как в репозитории: tracker для x5-proto-tracker' : undefined}
+        >
+          <Input disabled={mode === 'edit'} placeholder="tracker" />
         </Form.Item>
         <Form.Item name="name" label="Название" rules={[{ required: true }]}>
           <Input />

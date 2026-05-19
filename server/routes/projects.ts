@@ -33,6 +33,34 @@ function runGitSync(slug: string, gitlabUrl: string): ProtoSyncResult {
   return syncProtoFromGitlab(slug, gitlabUrl);
 }
 
+function markSyncPending(projectId: string) {
+  const now = new Date().toISOString();
+  db.update(projects)
+    .set({ syncStatus: 'syncing', syncError: null, updatedAt: now })
+    .where(eq(projects.id, projectId))
+    .run();
+}
+
+function scheduleGitSync(projectId: string, slug: string, gitlabUrl: string) {
+  markSyncPending(projectId);
+  setImmediate(() => {
+    try {
+      applySyncToProject(projectId, runGitSync(slug, gitlabUrl));
+    } catch (err) {
+      applySyncToProject(projectId, {
+        ok: false,
+        slug,
+        repoDir: '',
+        commit: null,
+        branch: null,
+        copiedTo: null,
+        message: 'Ошибка синхронизации',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+}
+
 const importSchema = z.object({
   slug: z.string().min(1).max(64),
   name: z.string().min(1).max(200),
@@ -169,13 +197,12 @@ projectsApi.post('/import', zValidator('json', importSchema), (c) => {
       .returning()
       .get();
     const count = db.select().from(remarks).where(eq(remarks.projectId, existing.id)).all().length;
-    const sync = runGitSync(data.slug, data.gitlabUrl);
-    applySyncToProject(existing.id, sync);
+    scheduleGitSync(existing.id, data.slug, data.gitlabUrl);
     const refreshed = db.select().from(projects).where(eq(projects.id, existing.id)).get()!;
     return c.json({
       ...enrich(refreshed, count),
       imported: 'updated' as const,
-      sync,
+      sync: { ok: true, message: 'Синхронизация GitLab запущена', pending: true },
     });
   }
 
@@ -195,10 +222,16 @@ projectsApi.post('/import', zValidator('json', importSchema), (c) => {
     })
     .returning()
     .get();
-  const sync = runGitSync(data.slug, data.gitlabUrl);
-  applySyncToProject(row!.id, sync);
+  scheduleGitSync(row!.id, data.slug, data.gitlabUrl);
   const refreshed = db.select().from(projects).where(eq(projects.id, row!.id)).get()!;
-  return c.json({ ...enrich(refreshed, 0), imported: 'created' as const, sync }, 201);
+  return c.json(
+    {
+      ...enrich(refreshed, 0),
+      imported: 'created' as const,
+      sync: { ok: true, message: 'Синхронизация GitLab запущена', pending: true },
+    },
+    201,
+  );
 });
 
 projectsApi.put('/:slug', zValidator('json', patchSchema), (c) => {
